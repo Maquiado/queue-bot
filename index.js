@@ -60,6 +60,17 @@ let currentInterval = POLL_INTERVAL_MS_MIN
 const queueCache = new Map()
 const assignedSet = new Set()
 let lastSeenTs = 0
+const sseClients = new Set()
+const MATCHMAKING_URL = process.env.MATCHMAKING_URL || ''
+
+async function loadAssignments() {
+  const snap = await db.collection('assignments').where('active', '==', true).limit(500).get()
+  snap.forEach((doc) => {
+    const data = doc.data() || {}
+    const pid = data.playerId || doc.id
+    assignedSet.add(pid)
+  })
+}
 
 async function processQueue() {
   try {
@@ -87,6 +98,7 @@ async function processQueue() {
     })
     console.log(`Sincronizados ${count} itens para cache`)
     await maybeHandoff()
+    broadcastQueue()
     return count > 0
   } catch (err) {
     console.error('Erro ao processar fila', err)
@@ -116,6 +128,7 @@ loop()
 
 const app = express()
 const PORT = parseInt(process.env.PORT || '3001', 10)
+app.use(express.json())
 app.get('/queue', (req, res) => {
   const arr = Array.from(queueCache.values()).sort((a, b) => {
     const ta = a.timestamp && a.timestamp.toMillis ? a.timestamp.toMillis() : 0
@@ -126,6 +139,22 @@ app.get('/queue', (req, res) => {
 })
 app.get('/health', (req, res) => {
   res.json({ cacheSize: queueCache.size, assignedCount: assignedSet.size, lastSeenTs })
+})
+app.get('/queue/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream')
+  res.setHeader('Cache-Control', 'no-cache')
+  res.setHeader('Connection', 'keep-alive')
+  sseClients.add(res)
+  const arr = Array.from(queueCache.values()).sort((a, b) => {
+    const ta = a.timestamp && a.timestamp.toMillis ? a.timestamp.toMillis() : 0
+    const tb = b.timestamp && b.timestamp.toMillis ? b.timestamp.toMillis() : 0
+    return ta - tb
+  })
+  res.write(`event: init\n`)
+  res.write(`data: ${JSON.stringify({ size: arr.length, players: arr })}\n\n`)
+  req.on('close', () => {
+    sseClients.delete(res)
+  })
 })
 app.get('/queue/summary', (req, res) => {
   const by = String(req.query.by || 'region,rank').split(',').map((s) => s.trim()).filter(Boolean)
@@ -176,6 +205,23 @@ app.post('/ready-check/:batchId', async (req, res) => {
     res.status(500).json({ error: 'ready_request_failed' })
   }
 })
+app.post('/queue/frame', async (req, res) => {
+  try {
+    const { id, frameColor, frameStyle } = req.body || {}
+    if (!id) {
+      res.status(400).json({ error: 'missing_id' })
+      return
+    }
+    const existing = queueCache.get(id) || { id }
+    if (frameColor != null) existing.frameColor = frameColor
+    if (frameStyle != null) existing.frameStyle = frameStyle
+    queueCache.set(id, existing)
+    broadcastQueue()
+    res.json({ ok: true, player: existing })
+  } catch (e) {
+    res.status(500).json({ error: 'frame_update_failed' })
+  }
+})
 app.listen(PORT, () => {
   console.log(`api ${PORT}`)
 })
@@ -196,6 +242,34 @@ async function maybeHandoff() {
     createdAt: admin.firestore.Timestamp.now(),
     status: 'pending',
   })
-  candidates.forEach((p) => assignedSet.add(p.id))
+  for (const p of candidates) {
+    const aRef = db.collection('assignments').doc(p.id)
+    await aRef.set({ playerId: p.id, batchId: batchRef.id, createdAt: admin.firestore.Timestamp.now(), active: true }, { merge: true })
+    assignedSet.add(p.id)
+  }
   console.log(`handoff ${batchRef.id} 10 jogadores`)
+  broadcastQueue()
+  if (MATCHMAKING_URL) {
+    try {
+      await fetch(MATCHMAKING_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: batchRef.id, players: candidates.map((p) => p.id) }) })
+      console.log(`notificado ${MATCHMAKING_URL} ${batchRef.id}`)
+    } catch (e) {
+      console.log('notificacao_falhou')
+    }
+  }
 }
+
+function broadcastQueue() {
+  if (!sseClients.size) return
+  const arr = Array.from(queueCache.values()).sort((a, b) => {
+    const ta = a.timestamp && a.timestamp.toMillis ? a.timestamp.toMillis() : 0
+    const tb = b.timestamp && b.timestamp.toMillis ? b.timestamp.toMillis() : 0
+    return ta - tb
+  })
+  const payload = `event: queue\n` + `data: ${JSON.stringify({ size: arr.length, players: arr })}\n\n`
+  sseClients.forEach((res) => {
+    try { res.write(payload) } catch (_) {}
+  })
+}
+
+loadAssignments().then(() => {}).catch(() => {})
