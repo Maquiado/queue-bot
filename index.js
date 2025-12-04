@@ -127,6 +127,55 @@ app.get('/queue', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({ cacheSize: queueCache.size, assignedCount: assignedSet.size, lastSeenTs })
 })
+app.get('/queue/summary', (req, res) => {
+  const by = String(req.query.by || 'region,rank').split(',').map((s) => s.trim()).filter(Boolean)
+  const arr = Array.from(queueCache.values())
+  const summary = {}
+  by.forEach((field) => {
+    const m = {}
+    arr.forEach((p) => {
+      const v = p[field] == null ? 'unknown' : p[field]
+      m[v] = (m[v] || 0) + 1
+    })
+    summary[field] = m
+  })
+  res.json({ by, summary })
+})
+app.get('/batches/pending', async (req, res) => {
+  try {
+    const snap = await db.collection('matchmaking_batches').where('status', '==', 'pending').limit(20).get()
+    if (snap.empty) {
+      res.status(404).json({ message: 'none' })
+      return
+    }
+    const items = []
+    snap.forEach((doc) => items.push({ id: doc.id, ...doc.data() }))
+    items.sort((a, b) => {
+      const ta = a.createdAt && a.createdAt.toMillis ? a.createdAt.toMillis() : 0
+      const tb = b.createdAt && b.createdAt.toMillis ? b.createdAt.toMillis() : 0
+      return tb - ta
+    })
+    res.json({ size: items.length, latest: items[0], items })
+  } catch (e) {
+    res.status(500).json({ error: 'query_failed' })
+  }
+})
+app.post('/ready-check/:batchId', async (req, res) => {
+  try {
+    const batchId = req.params.batchId
+    const ref = db.collection('matchmaking_batches').doc(batchId)
+    const snap = await ref.get()
+    if (!snap.exists) {
+      res.status(404).json({ error: 'batch_not_found' })
+      return
+    }
+    await ref.set({ status: 'ready_requested', readyRequestedAt: admin.firestore.Timestamp.now() }, { merge: true })
+    const data = await ref.get()
+    res.json({ id: ref.id, ...data.data() })
+  } catch (e) {
+    res.status(500).json({ error: 'ready_request_failed' })
+  }
+})
 app.listen(PORT, () => {
   console.log(`api ${PORT}`)
 })
