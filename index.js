@@ -2,6 +2,7 @@ require('dotenv').config()
 const admin = require('firebase-admin')
 const crypto = require('crypto')
 const express = require('express')
+const cors = require('cors')
 
 if (process.env.FIRESTORE_EMULATOR_HOST) {
   admin.initializeApp()
@@ -128,6 +129,7 @@ loop()
 
 const app = express()
 const PORT = parseInt(process.env.PORT || '3001', 10)
+app.use(cors({ origin: process.env.CORS_ORIGIN || '*', methods: ['GET','POST'], credentials: false }))
 app.use(express.json())
 app.get('/queue', (req, res) => {
   const arr = Array.from(queueCache.values()).sort((a, b) => {
@@ -207,15 +209,25 @@ app.post('/ready-check/:batchId', async (req, res) => {
 })
 app.post('/queue/frame', async (req, res) => {
   try {
-    const { id, frameColor, frameStyle } = req.body || {}
-    if (!id) {
+    const { id, playerId, frameColor, frameStyle } = req.body || {}
+    const pid = id || playerId
+    if (!pid) {
       res.status(400).json({ error: 'missing_id' })
       return
     }
-    const existing = queueCache.get(id) || { id }
+    let key = pid
+    if (!queueCache.has(key)) {
+      for (const [docId, p] of queueCache.entries()) {
+        if (p.userId === pid || p.uid === pid || p.discordId === pid || p.id === pid) {
+          key = docId
+          break
+        }
+      }
+    }
+    const existing = queueCache.get(key) || { id: key }
     if (frameColor != null) existing.frameColor = frameColor
     if (frameStyle != null) existing.frameStyle = frameStyle
-    queueCache.set(id, existing)
+    queueCache.set(key, existing)
     broadcastQueue()
     res.json({ ok: true, player: existing })
   } catch (e) {
