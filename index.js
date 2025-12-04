@@ -1,0 +1,152 @@
+require('dotenv').config()
+const admin = require('firebase-admin')
+const crypto = require('crypto')
+const express = require('express')
+
+if (process.env.FIRESTORE_EMULATOR_HOST) {
+  admin.initializeApp()
+} else {
+  const saJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
+  if (!saJson) {
+    console.error('FIREBASE_SERVICE_ACCOUNT_JSON ausente')
+    process.exit(1)
+  }
+
+  let serviceAccount
+  try {
+    serviceAccount = JSON.parse(saJson)
+  } catch (e) {
+    console.error('FIREBASE_SERVICE_ACCOUNT_JSON inválido')
+    process.exit(1)
+  }
+  if (serviceAccount.private_key) {
+    serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n')
+  }
+
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  })
+}
+
+const db = admin.firestore()
+const BOT_ID = process.env.BOT_ID || crypto.randomBytes(8).toString('hex')
+const LOCK_TTL_MS = parseInt(process.env.LOCK_TTL_MS || '20000', 10)
+const lockRef = db.collection('locks').doc('queue-bot')
+
+async function acquireLock() {
+  const now = Date.now()
+  return db.runTransaction(async (t) => {
+    const snap = await t.get(lockRef)
+    if (!snap.exists) {
+      t.set(lockRef, { owner: BOT_ID, expiresAt: admin.firestore.Timestamp.fromMillis(now + LOCK_TTL_MS) })
+      return true
+    }
+    const data = snap.data() || {}
+    const owner = data.owner
+    const expiresAt = data.expiresAt
+    const expired = !expiresAt || (expiresAt.toMillis && expiresAt.toMillis() <= now)
+    if (expired || owner === BOT_ID) {
+      t.set(lockRef, { owner: BOT_ID, expiresAt: admin.firestore.Timestamp.fromMillis(now + LOCK_TTL_MS) }, { merge: true })
+      return true
+    }
+    return false
+  })
+}
+
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '10', 10)
+const POLL_INTERVAL_MS_MIN = parseInt(process.env.POLL_INTERVAL_MS_MIN || '5000', 10)
+const POLL_INTERVAL_MS_MAX = parseInt(process.env.POLL_INTERVAL_MS_MAX || '30000', 10)
+let currentInterval = POLL_INTERVAL_MS_MIN
+const queueCache = new Map()
+const assignedSet = new Set()
+let lastSeenTs = 0
+
+async function processQueue() {
+  try {
+    let q = db.collection('queue').orderBy('timestamp', 'asc').limit(BATCH_SIZE)
+    if (lastSeenTs > 0) {
+      q = db.collection('queue')
+        .where('timestamp', '>', admin.firestore.Timestamp.fromMillis(lastSeenTs))
+        .orderBy('timestamp', 'asc')
+        .limit(BATCH_SIZE)
+    }
+    const snapshot = await q.get()
+
+    if (snapshot.empty) {
+      console.log('Nenhum item na fila')
+      return false
+    }
+
+    let count = 0
+    snapshot.forEach((doc) => {
+      const data = doc.data()
+      const ts = data.timestamp && data.timestamp.toMillis ? data.timestamp.toMillis() : 0
+      lastSeenTs = Math.max(lastSeenTs, ts)
+      queueCache.set(doc.id, { id: doc.id, ...data })
+      count += 1
+    })
+    console.log(`Sincronizados ${count} itens para cache`)
+    await maybeHandoff()
+    return count > 0
+  } catch (err) {
+    console.error('Erro ao processar fila', err)
+    return false
+  }
+}
+
+console.log('queue-bot iniciado')
+async function loop() {
+  const hasLock = await acquireLock()
+  if (!hasLock) {
+    console.log('Sem lock, aguardando')
+    currentInterval = Math.min(POLL_INTERVAL_MS_MAX, currentInterval * 2)
+    setTimeout(loop, currentInterval)
+    return
+  }
+  const processed = await processQueue()
+  if (processed) {
+    currentInterval = Math.max(POLL_INTERVAL_MS_MIN, Math.floor(currentInterval / 2))
+  } else {
+    currentInterval = Math.min(POLL_INTERVAL_MS_MAX, currentInterval * 2)
+  }
+  setTimeout(loop, currentInterval)
+}
+
+loop()
+
+const app = express()
+const PORT = parseInt(process.env.PORT || '3001', 10)
+app.get('/queue', (req, res) => {
+  const arr = Array.from(queueCache.values()).sort((a, b) => {
+    const ta = a.timestamp && a.timestamp.toMillis ? a.timestamp.toMillis() : 0
+    const tb = b.timestamp && b.timestamp.toMillis ? b.timestamp.toMillis() : 0
+    return ta - tb
+  })
+  res.json({ size: arr.length, players: arr })
+})
+app.get('/health', (req, res) => {
+  res.json({ cacheSize: queueCache.size, assignedCount: assignedSet.size, lastSeenTs })
+})
+app.listen(PORT, () => {
+  console.log(`api ${PORT}`)
+})
+
+async function maybeHandoff() {
+  const candidates = Array.from(queueCache.values())
+    .filter((p) => !assignedSet.has(p.id))
+    .sort((a, b) => {
+      const ta = a.timestamp && a.timestamp.toMillis ? a.timestamp.toMillis() : 0
+      const tb = b.timestamp && b.timestamp.toMillis ? b.timestamp.toMillis() : 0
+      return ta - tb
+    })
+    .slice(0, 10)
+  if (candidates.length < 10) return
+  const batchRef = db.collection('matchmaking_batches').doc()
+  await batchRef.set({
+    players: candidates.map((p) => p.id),
+    createdAt: admin.firestore.Timestamp.now(),
+    status: 'pending',
+  })
+  candidates.forEach((p) => assignedSet.add(p.id))
+  console.log(`handoff ${batchRef.id} 10 jogadores`)
+}
