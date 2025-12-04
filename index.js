@@ -8,25 +8,23 @@ if (process.env.FIRESTORE_EMULATOR_HOST) {
   admin.initializeApp()
 } else {
   const saJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
-  if (!saJson) {
-    console.error('FIREBASE_SERVICE_ACCOUNT_JSON ausente')
+  const saPath = process.env.GOOGLE_APPLICATION_CREDENTIALS || process.env.FIREBASE_SERVICE_ACCOUNT
+  if (!saJson && !saPath) {
+    console.error('FIREBASE_SERVICE_ACCOUNT ausente')
     process.exit(1)
   }
-
   let serviceAccount
   try {
-    serviceAccount = JSON.parse(saJson)
+    serviceAccount = saJson ? JSON.parse(saJson) : require(saPath)
   } catch (e) {
-    console.error('FIREBASE_SERVICE_ACCOUNT_JSON inválido')
+    console.error('FIREBASE_SERVICE_ACCOUNT inválido')
     process.exit(1)
   }
   if (serviceAccount.private_key) {
     serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n')
   }
-
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-  })
+  const projectId = serviceAccount.project_id || process.env.FIREBASE_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT
+  admin.initializeApp(projectId ? { credential: admin.credential.cert(serviceAccount), projectId } : { credential: admin.credential.cert(serviceAccount) })
 }
 
 const db = admin.firestore()
