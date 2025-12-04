@@ -129,7 +129,15 @@ loop()
 
 const app = express()
 const PORT = parseInt(process.env.PORT || '3001', 10)
-app.use(cors({ origin: process.env.CORS_ORIGIN || '*', methods: ['GET','POST'], credentials: false }))
+const allowedOrigins = (process.env.CORS_ORIGIN || '*').split(',').map((s) => s.trim()).filter(Boolean)
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin)) return cb(null, true)
+    return cb(new Error('Not allowed by CORS'))
+  },
+  methods: ['GET', 'POST'],
+  credentials: false,
+}))
 app.use(express.json())
 app.get('/queue', (req, res) => {
   const arr = Array.from(queueCache.values()).sort((a, b) => {
