@@ -73,9 +73,9 @@ async function loadAssignments() {
 
 async function processQueue() {
   try {
-    let q = db.collection('queue').orderBy('timestamp', 'asc').limit(BATCH_SIZE)
+    let q = db.collection('queuee').orderBy('timestamp', 'asc').limit(BATCH_SIZE)
     if (lastSeenTs > 0) {
-      q = db.collection('queue')
+      q = db.collection('queuee')
         .where('timestamp', '>', admin.firestore.Timestamp.fromMillis(lastSeenTs))
         .orderBy('timestamp', 'asc')
         .limit(BATCH_SIZE)
