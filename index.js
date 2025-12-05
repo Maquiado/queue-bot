@@ -1,5 +1,5 @@
-const { db, FieldValue, Timestamp } = require('../bots/shared/firebase');
-const { sortTeams } = require('../bots/shared/elo');
+const { db, FieldValue, Timestamp } = require('./firebase');
+const { sortTeams } = require('./elo');
 
 let autoEnabled = false;
 let unsubConfig = null;
@@ -104,4 +104,3 @@ async function formReadyCheck(players) {
 }
 
 start();
-
